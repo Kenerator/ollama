@@ -40,99 +40,148 @@ jobs:
           echo changed=$(changed 'llama/llama.cpp/**/*' 'ml/backend/ggml/ggml/**/*' '.github/**/*') | tee -a $GITHUB_OUTPUT
           echo vendorsha=$(make -f Makefile.sync print-base) | tee -a $GITHUB_OUTPUT
 
-  linux:
+  # TEMPORARY: Linux MLX-only build tuning experiment.  Mirrors release.yaml's
+  # linux-depends MLX target only (other targets/arches intentionally
+  # omitted).  Full host-side instrumentation (mpstat / vmstat / iostat /
+  # pidstat + per-process and loadavg pollers) so we can see how CPU, RAM,
+  # swap, and I/O behave throughout the run and tune accordingly.
+  # Build runs `-l $(nproc)` (load-gated, no -j cap); the heavy CUTLASS
+  # files are constrained by a CMake JOB_POOL applied at MLX configure time
+  # (see x/imagegen/mlx/CMakeLists.txt).
+  linux-mlx-timing:
     needs: [changes]
     if: needs.changes.outputs.changed == 'True'
+    environment: release
     strategy:
       matrix:
         include:
-          - preset: CPU
-          - preset: CUDA
-            container: nvidia/cuda:13.0.0-devel-ubuntu22.04
-            flags: '-DCMAKE_CUDA_ARCHITECTURES=87'
-          - preset: ROCm
-            container: rocm/dev-ubuntu-22.04:7.2.1
-            extra-packages: rocm-libs
-            flags: '-DAMDGPU_TARGETS=gfx1010 -DCMAKE_PREFIX_PATH=/opt/rocm'
-          - preset: Vulkan
-            container: ubuntu:22.04
-            extra-packages: >
-              mesa-vulkan-drivers vulkan-tools
-              libvulkan1 libvulkan-dev
-              vulkan-sdk cmake ccache g++ make
-          - preset: 'MLX CUDA 13'
-            container: nvidia/cuda:13.0.0-devel-ubuntu22.04
-            extra-packages: libcudnn9-dev-cuda-13 libopenblas-dev liblapack-dev liblapacke-dev git curl
-            flags: '-DCMAKE_CUDA_ARCHITECTURES=87 -DMLX_CUDA_ARCHITECTURES=80-virtual -DBLAS_INCLUDE_DIRS=/usr/include/x86_64-linux-gnu -DLAPACK_INCLUDE_DIRS=/usr/include/x86_64-linux-gnu'
-            install-go: true
+          - arch: amd64
+            target: mlx
+            # Tuning knob: nvcc -t passed via Dockerfile ARG.  No -j here -
+            # the build defaults to ninja -l $(nproc) inside the container.
+            nvcc-threads: 11
     runs-on: linux
-    container: ${{ matrix.container }}
     steps:
       - uses: actions/checkout@v4
-      - run: |
-          [ -n "${{ matrix.container }}" ] || sudo=sudo
-          $sudo apt-get update
-          # Add LunarG Vulkan SDK apt repo for Ubuntu 22.04
-          if [ "${{ matrix.preset }}" = "Vulkan" ]; then
-            $sudo apt-get install -y --no-install-recommends wget gnupg ca-certificates software-properties-common
-            wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | $sudo gpg --dearmor -o /usr/share/keyrings/lunarg-archive-keyring.gpg
-            # Use signed-by to bind the repo to the installed keyring to avoid NO_PUBKEY
-            echo "deb [signed-by=/usr/share/keyrings/lunarg-archive-keyring.gpg]  https://packages.lunarg.com/vulkan/1.4.313 jammy main" | $sudo tee /etc/apt/sources.list.d/lunarg-vulkan-1.4.313-jammy.list > /dev/null
-            $sudo apt-get update
-          fi
-          $sudo apt-get install -y cmake ccache ${{ matrix.extra-packages }}
-          # MLX requires CMake 3.25+, install from official releases
-          if [ "${{ matrix.preset }}" = "MLX CUDA 13" ]; then
-            curl -fsSL https://github.com/Kitware/CMake/releases/download/v3.31.2/cmake-3.31.2-linux-$(uname -m).tar.gz | $sudo tar xz -C /usr/local --strip-components 1
-          fi
-          # Export VULKAN_SDK if provided by LunarG package (defensive)
-          if [ -d "/usr/lib/x86_64-linux-gnu/vulkan" ] && [ "${{ matrix.preset }}" = "Vulkan" ]; then
-            echo "VULKAN_SDK=/usr" >> $GITHUB_ENV
-          fi
-        env:
-          DEBIAN_FRONTEND: noninteractive
-      - if: matrix.install-go
-        name: Install Go
-        run: |
-          GO_VERSION=$(awk '/^go / { print $2 }' go.mod)
-          curl -fsSL "https://golang.org/dl/go${GO_VERSION}.linux-$(dpkg --print-architecture).tar.gz" | tar xz -C /usr/local
-          echo "/usr/local/go/bin" >> $GITHUB_PATH
-      - uses: actions/cache@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
         with:
-          path: /github/home/.cache/ccache
-          key: ccache-${{ runner.os }}-${{ runner.arch }}-${{ matrix.preset }}-${{ needs.changes.outputs.vendorsha }}
-      - run: |
-          cmake --preset "${{ matrix.preset }}" ${{ matrix.flags }}
-          cmake --build --preset "${{ matrix.preset }}" -- -l $(nproc)
+          username: ${{ vars.DOCKER_USER }}
+          password: ${{ secrets.DOCKER_ACCESS_TOKEN }}
+      # Best-effort host-side instrumentation; failure is non-fatal.
+      - name: Start resource instrumentation
+        continue-on-error: true
+        run: |
+          set -e
+          if ! command -v mpstat >/dev/null 2>&1; then
+            sudo apt-get update >/dev/null 2>&1 || apt-get update >/dev/null 2>&1 || true
+            sudo apt-get install -y --no-install-recommends sysstat 2>/dev/null \
+              || apt-get install -y --no-install-recommends sysstat 2>/dev/null \
+              || echo "WARN: failed to install sysstat; some metrics may be missing"
+          fi
+          mkdir -p /tmp/instrumentation
+          {
+            echo "===== runner identity ====="
+            uname -a
+            nproc
+            free -h
+            df -h
+            cat /proc/meminfo | head -5
+          } > /tmp/instrumentation/host.log
+          # Sidecar samplers.  mpstat per-core proves whether the tail is
+          # single-core bound; vmstat catches swap/free trends; pidstat
+          # gives us per-process RSS for the cicc/nvcc/link processes.
+          nohup mpstat -P ALL 5     > /tmp/instrumentation/mpstat.log   2>&1 &
+          nohup vmstat -t 5         > /tmp/instrumentation/vmstat.log   2>&1 &
+          nohup iostat -xt 5        > /tmp/instrumentation/iostat.log   2>&1 &
+          nohup pidstat -u -r -d -h 5 > /tmp/instrumentation/pidstat.log 2>&1 &
+          nohup bash -c 'while true; do echo "===== $(date -Iseconds) ====="; ps -eo pid,ppid,user,%cpu,%mem,rss,vsz,comm,args --sort=-rss | head -40; sleep 30; done' \
+                                    > /tmp/instrumentation/ps.log       2>&1 &
+          nohup bash -c 'while true; do printf "%s " "$(date -Iseconds)"; cat /proc/loadavg; sleep 10; done' \
+                                    > /tmp/instrumentation/loadavg.log  2>&1 &
+          nohup bash -c 'while true; do date -Iseconds; df -h /; echo; sleep 60; done' \
+                                    > /tmp/instrumentation/disk.log     2>&1 &
+          echo "Background loggers started:"
+          ps -ef | grep -E 'vmstat|iostat|pidstat|mpstat|while true' | grep -v grep || true
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          target: ${{ matrix.target }}
+          provenance: false
+          sbom: false
+          build-args: |
+            CGO_CFLAGS=-O3
+            CGO_CXXFLAGS=-O3
+            APT_MIRROR=http://azure.archive.ubuntu.com/ubuntu
+            OLLAMA_MLX_NVCC_THREADS=${{ matrix.nvcc-threads }}
+          # Per-PR cache namespace.  Delete `ollama/release:cache-pr<N>-amd64-mlx`
+          # on Docker Hub to force a cold rebuild.
+          cache-from: |
+            type=registry,ref=ollama/release:cache-pr${{ github.event.pull_request.number }}-${{ matrix.arch }}-${{ matrix.target }}
+          cache-to: type=registry,ref=ollama/release:cache-pr${{ github.event.pull_request.number }}-${{ matrix.arch }}-${{ matrix.target }},mode=max
+      - if: always()
+        name: Stop instrumentation and summarize
+        run: |
+          pkill -f 'vmstat -t 5'         || true
+          pkill -f 'iostat -xt 5'        || true
+          pkill -f 'pidstat -u -r'       || true
+          pkill -f 'mpstat -P ALL'       || true
+          pkill -f 'while true; do echo' || true
+          pkill -f 'while true; do date' || true
+          pkill -f 'while true; do printf' || true
+          sleep 2
+          # Compute peak memory used from vmstat 'free' column (col 4, KB).
+          if [ -f /tmp/instrumentation/vmstat.log ]; then
+            FREE_VALS=$(awk 'NR>2 && /^[ ]*[0-9]/ {print $4}' /tmp/instrumentation/vmstat.log)
+            if [ -n "$FREE_VALS" ]; then
+              MIN_FREE=$(echo "$FREE_VALS" | sort -n | head -1)
+              MAX_FREE=$(echo "$FREE_VALS" | sort -n | tail -1)
+              TOTAL_KB=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+              if [ -n "$TOTAL_KB" ] && [ -n "$MIN_FREE" ]; then
+                echo "===== MEMORY PEAK (vmstat) ====="
+                printf "Total RAM:       %d GB\n" $((TOTAL_KB / 1024 / 1024))
+                printf "Peak RAM used:   %d GB  (min free: %d GB)\n" $(((TOTAL_KB - MIN_FREE) / 1024 / 1024)) $((MIN_FREE / 1024 / 1024))
+                printf "Min RAM used:    %d GB  (max free: %d GB)\n" $(((TOTAL_KB - MAX_FREE) / 1024 / 1024)) $((MAX_FREE / 1024 / 1024))
+              fi
+            fi
+          fi
+          # Peak swap used (vmstat col 3 = swpd, KB)
+          if [ -f /tmp/instrumentation/vmstat.log ]; then
+            MAX_SWPD=$(awk 'NR>2 && /^[ ]*[0-9]/ {print $3}' /tmp/instrumentation/vmstat.log | sort -n | tail -1)
+            if [ -n "$MAX_SWPD" ]; then
+              printf "Peak swap used:  %d MB\n" $((MAX_SWPD / 1024))
+            fi
+          fi
+          echo
+          echo "===== Instrumentation files ====="
+          ls -lh /tmp/instrumentation/ || true
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: instrumentation-linux-mlx
+          path: /tmp/instrumentation/
+          if-no-files-found: warn
 
-  windows:
+  # TEMPORARY: Windows MLX build tuning experiment.  Mirrors release.yaml's
+  # windows-depends MLX entry (full 11-virtual-arch CUDA list, real CUDA +
+  # cuDNN install) with full system instrumentation.  Vary `nvcc-threads`
+  # in the matrix to iterate; build-side concurrency is `-l nproc` plus the
+  # CMake JOB_POOL on heavy CUTLASS files.
+  #
+  # All other test jobs (linux, generic windows, go_mod_tidy, test, patches)
+  # are intentionally omitted on this branch.  Revert this whole file before
+  # merging to main.
+  windows-mlx-timing:
     needs: [changes]
     if: needs.changes.outputs.changed == 'True'
+    environment: release
     strategy:
       matrix:
         include:
-          - preset: CPU
-          - preset: CUDA
-            install: https://developer.download.nvidia.com/compute/cuda/13.0.0/local_installers/cuda_13.0.0_windows.exe
-            flags: '-DCMAKE_CUDA_ARCHITECTURES=80'
-            cuda-components:
-              - '"cudart"'
-              - '"nvcc"'
-              - '"cublas"'
-              - '"cublas_dev"'
-              - '"crt"'
-              - '"nvvm"'
-              - '"nvptxcompiler"'
-            cuda-version: '13.0'
-          - preset: ROCm
-            install: https://download.amd.com/developer/eula/rocm-hub/AMD-Software-PRO-Edition-24.Q4-WinSvr2022-For-HIP.exe
-            flags: '-DAMDGPU_TARGETS=gfx1010 -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_FLAGS="-parallel-jobs=4 -Wno-ignored-attributes -Wno-deprecated-pragma" -DCMAKE_CXX_FLAGS="-parallel-jobs=4 -Wno-ignored-attributes -Wno-deprecated-pragma"'
-          - preset: Vulkan
-            install: https://sdk.lunarg.com/sdk/download/1.4.321.1/windows/vulkansdk-windows-X64-1.4.321.1.exe
           - preset: 'MLX CUDA 13'
             install: https://developer.download.nvidia.com/compute/cuda/13.0.0/local_installers/cuda_13.0.0_windows.exe
             cudnn-install: https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/cudnn-windows-x86_64-9.18.1.3_cuda13-archive.zip
-            flags: '-DCMAKE_CUDA_ARCHITECTURES=80 -DMLX_CUDA_ARCHITECTURES=80-virtual'
             cuda-components:
               - '"cudart"'
               - '"nvcc"'
@@ -146,25 +195,27 @@ jobs:
               - '"nvvm"'
               - '"nvptxcompiler"'
             cuda-version: '13.0'
+            # Tuning knob.  Edit and force-push to iterate.
+            # Build-side parallelism is now `-l nproc` (load-gated, no -j
+            # cap) plus the CMake JOB_POOL on heavy CUTLASS files - so we
+            # only need to tune nvcc -t at this level.
+            nvcc-threads: 11
     runs-on: windows
     steps:
-      - run: |
+      - name: Install system dependencies
+        run: |
           choco install -y --no-progress ccache ninja
           if (Get-Command ccache -ErrorAction SilentlyContinue) {
             ccache -o cache_dir=${{ github.workspace }}\.ccache
           }
-      - if: matrix.preset == 'CUDA' || matrix.preset == 'ROCm' || matrix.preset == 'Vulkan' || matrix.preset == 'MLX CUDA 13'
-        id: cache-install
+      - id: cache-install
         uses: actions/cache/restore@v4
         with:
           path: |
             C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA
-            C:\Program Files\AMD\ROCm
-            C:\VulkanSDK
             C:\Program Files\NVIDIA\CUDNN
           key: ${{ matrix.install }}-${{ matrix.cudnn-install }}
-      - if: matrix.preset == 'CUDA' || matrix.preset == 'MLX CUDA 13'
-        name: Install CUDA ${{ matrix.cuda-version }}
+      - name: Install CUDA ${{ matrix.cuda-version }}
         run: |
           $ErrorActionPreference = "Stop"
           if ("${{ steps.cache-install.outputs.cache-hit }}" -ne 'true') {
@@ -175,36 +226,7 @@ jobs:
 
           $cudaPath = (Resolve-Path "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\*").path
           echo "$cudaPath\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-      - if: matrix.preset == 'ROCm'
-        name: Install ROCm ${{ matrix.rocm-version }}
-        run: |
-          $ErrorActionPreference = "Stop"
-          if ("${{ steps.cache-install.outputs.cache-hit }}" -ne 'true') {
-            Invoke-WebRequest -Uri "${{ matrix.install }}" -OutFile "install.exe"
-            Start-Process -FilePath .\install.exe -ArgumentList '-install' -NoNewWindow -Wait
-          }
-
-          $hipPath = (Resolve-Path "C:\Program Files\AMD\ROCm\*").path
-          echo "$hipPath\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          echo "CC=$hipPath\bin\clang.exe" | Out-File -FilePath $env:GITHUB_ENV -Append
-          echo "CXX=$hipPath\bin\clang++.exe" | Out-File -FilePath $env:GITHUB_ENV -Append
-          echo "HIPCXX=$hipPath\bin\clang++.exe" | Out-File -FilePath $env:GITHUB_ENV -Append
-          echo "HIP_PLATFORM=amd" | Out-File -FilePath $env:GITHUB_ENV -Append
-          echo "CMAKE_PREFIX_PATH=$hipPath" | Out-File -FilePath $env:GITHUB_ENV -Append
-      - if: matrix.preset == 'Vulkan'
-        name: Install Vulkan ${{ matrix.rocm-version }}
-        run: |
-          $ErrorActionPreference = "Stop"
-          if ("${{ steps.cache-install.outputs.cache-hit }}" -ne 'true') {
-            Invoke-WebRequest -Uri "${{ matrix.install }}" -OutFile "install.exe"
-            Start-Process -FilePath .\install.exe -ArgumentList "-c","--am","--al","in" -NoNewWindow -Wait
-          }
-
-          $vulkanPath = (Resolve-Path "C:\VulkanSDK\*").path
-          echo "$vulkanPath\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          echo "VULKAN_SDK=$vulkanPath" >> $env:GITHUB_ENV
-      - if: matrix.preset == 'MLX CUDA 13'
-        name: Install cuDNN for MLX
+      - name: Install cuDNN for MLX
         run: |
           $ErrorActionPreference = "Stop"
           $cudnnRoot = "C:\Program Files\NVIDIA\CUDNN"
@@ -225,74 +247,225 @@ jobs:
         with:
           path: |
             C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA
-            C:\Program Files\AMD\ROCm
-            C:\VulkanSDK
             C:\Program Files\NVIDIA\CUDNN
           key: ${{ matrix.install }}-${{ matrix.cudnn-install }}
       - uses: actions/checkout@v4
       - uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}\.ccache
-          key: ccache-${{ runner.os }}-${{ runner.arch }}-${{ matrix.preset }}-${{ needs.changes.outputs.vendorsha }}
-      - run: |
+          key: ccache-windows-mlx-pr${{ github.event.pull_request.number }}-${{ needs.changes.outputs.vendorsha }}
+          restore-keys: |
+            ccache-windows-mlx-pr${{ github.event.pull_request.number }}-
+            ccache-windows-mlx-
+      - name: Runner system info
+        run: |
+          Get-CimInstance Win32_Processor | Select-Object Name, NumberOfCores, NumberOfLogicalProcessors, MaxClockSpeed | Format-Table -AutoSize
+          Get-CimInstance Win32_OperatingSystem | Select-Object @{N='TotalRAM_GB';E={[Math]::Round($_.TotalVisibleMemorySize/1MB, 2)}}, @{N='FreeRAM_GB';E={[Math]::Round($_.FreePhysicalMemory/1MB, 2)}} | Format-Table -AutoSize
+          Get-PSDrive C | Select-Object Used, Free | Format-Table -AutoSize
+          Write-Host "Tuning: nvcc-threads=${{ matrix.nvcc-threads }}, build=-l nproc + CMake JOB_POOL"
+      # System-wide instrumentation: CPU (overall + per-core), RAM,
+      # committed bytes, page faults, pagefile usage, disk I/O.  Sampled
+      # every 5s by typeperf.  Per-process top-by-RSS snapshots every 30s
+      # via a PowerShell background job.  All artifacts uploaded at the
+      # end of the job for offline analysis.
+      # Instrumentation is best-effort; any failure here logs a warning
+      # but never aborts the experiment.
+      # Cross-step background telemetry on Windows, in bash.  Per
+      # actions/runner source (JobExtension.cs:713-761), processes
+      # spawned in any step survive until end-of-job, NOT end-of-step,
+      # so background processes started here persist through the long
+      # Build step that follows.
+      #
+      # Bash flavor mirrors the Linux instrumentation pattern (the
+      # known-working approach) and avoids PowerShell-specific quirks:
+      #   - typeperf launched via `cmd //c` with -cf counter file (the
+      #     prior -ArgumentList array spread silently dropped 8 of 9
+      #     counters)
+      #   - typeperf stdout/stderr captured to files so "counter not
+      #     found" messages become visible
+      #   - Per-process sampler spawned via `pwsh -File` in background
+      #     (NOT Start-Job which dies with parent shell)
+      #   - Stop step uses `taskkill //PID` without `/F` so typeperf
+      #     gets a clean shutdown signal and flushes its CSV; `/F`
+      #     calls TerminateProcess and loses buffered data
+      - name: Start resource instrumentation
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -u
+          INSTDIR="$RUNNER_TEMP/instrumentation"
+          mkdir -p "$INSTDIR"
+          INSTDIR_WIN=$(cygpath -w "$INSTDIR")
+
+          # Host info
+          {
+            echo "===== runner identity ====="
+            wmic cpu get Name,NumberOfCores,NumberOfLogicalProcessors,MaxClockSpeed /format:list 2>&1 || true
+            wmic os get TotalVisibleMemorySize,FreePhysicalMemory,SizeStoredInPagingFiles /format:list 2>&1 || true
+            wmic logicaldisk where DeviceID='C:' get Size,FreeSpace /format:list 2>&1 || true
+          } > "$INSTDIR/host.log"
+
+          # System counter list (one per line - typeperf -cf format).
+          # printf-with-quoted-args avoids any YAML/heredoc indentation
+          # interaction; each '%s\n' adds one line.
+          printf '%s\n' \
+            '\Processor(_Total)\% Processor Time' \
+            '\Memory\Available MBytes' \
+            '\Memory\Committed Bytes' \
+            '\Memory\% Committed Bytes In Use' \
+            '\Memory\Pages/sec' \
+            '\Memory\Page Faults/sec' \
+            '\Paging File(_Total)\% Usage' \
+            '\PhysicalDisk(_Total)\Disk Bytes/sec' \
+            '\PhysicalDisk(_Total)\Avg. Disk Queue Length' \
+            > "$INSTDIR/counters-sys.txt"
+          printf '%s\n' '\Processor(*)\% Processor Time' > "$INSTDIR/counters-cores.txt"
+
+          # System-wide perf counters via cmd-launched typeperf, backgrounded
+          cmd //c "typeperf -f CSV -si 5 -cf \"$INSTDIR_WIN\\counters-sys.txt\" -o \"$INSTDIR_WIN\\perf-system.csv\"" \
+            > "$INSTDIR/typeperf-sys.out" 2> "$INSTDIR/typeperf-sys.err" &
+          echo $! > "$INSTDIR/typeperf-sys.pid"
+
+          # Per-core CPU counters
+          cmd //c "typeperf -f CSV -si 5 -cf \"$INSTDIR_WIN\\counters-cores.txt\" -o \"$INSTDIR_WIN\\perf-cores.csv\"" \
+            > "$INSTDIR/typeperf-cores.out" 2> "$INSTDIR/typeperf-cores.err" &
+          echo $! > "$INSTDIR/typeperf-cores.pid"
+
+          # Per-process snapshot via pwsh script, backgrounded.  Script
+          # written line-by-line via printf to keep YAML indentation
+          # unambiguous.
+          printf '%s\n' \
+            'param([string]$LogPath)' \
+            'while ($true) {' \
+            '    try {' \
+            '        $ts = (Get-Date).ToString("o")' \
+            '        "===== $ts =====" | Out-File -FilePath $LogPath -Append' \
+            '        Get-Process -ErrorAction SilentlyContinue |' \
+            '            Sort-Object -Property WorkingSet64 -Descending |' \
+            '            Select-Object -First 40 -Property Id, ProcessName, CPU,' \
+            '                @{N="WS_MB";      E={[Math]::Round($_.WorkingSet64/1MB,1)}},' \
+            '                @{N="Private_MB"; E={[Math]::Round($_.PrivateMemorySize64/1MB,1)}} |' \
+            '            Format-Table -AutoSize |' \
+            '            Out-String -Width 250 |' \
+            '            Out-File -FilePath $LogPath -Append' \
+            '    } catch {' \
+            '        ("ERROR " + (Get-Date).ToString("o") + ": " + $_) | Out-File -FilePath $LogPath -Append' \
+            '    }' \
+            '    Start-Sleep -Seconds 30' \
+            '}' \
+            > "$INSTDIR/ps-sampler.ps1"
+          pwsh -NoProfile -File "$INSTDIR/ps-sampler.ps1" "$INSTDIR_WIN\\ps.log" \
+            > "$INSTDIR/ps-sampler.out" 2> "$INSTDIR/ps-sampler.err" &
+          echo $! > "$INSTDIR/ps-sampler.pid"
+
+          echo "Samplers started:"
+          for p in typeperf-sys.pid typeperf-cores.pid ps-sampler.pid; do
+            [ -f "$INSTDIR/$p" ] && echo "  $p = $(cat "$INSTDIR/$p")"
+          done
+      - name: Build MLX (timed) - nvcc-threads=${{ matrix.nvcc-threads }}
+        run: |
           Import-Module 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\Microsoft.VisualStudio.DevShell.dll'
-          Enter-VsDevShell -VsInstallPath 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise' -SkipAutomaticLocation  -DevCmdArguments '-arch=x64 -no_logo'
-          cmake --preset "${{ matrix.preset }}" ${{ matrix.flags }}
+          Enter-VsDevShell -VsInstallPath 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise' -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -no_logo'
+
+          $start = Get-Date
+          cmake --preset "${{ matrix.preset }}" `
+              -DCMAKE_CUDA_FLAGS="-t ${{ matrix.nvcc-threads }}" `
+              --install-prefix "$((pwd).Path)\dist\windows-amd64"
+          if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE) }
+          $configEnd = Get-Date
+
           cmake --build --preset "${{ matrix.preset }}" -- -l $([Environment]::ProcessorCount)
+          if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE) }
+          $buildEnd = Get-Date
+
+          cmake --install build --component MLX --strip
+          if ($LASTEXITCODE -ne 0) { exit($LASTEXITCODE) }
+          $installEnd = Get-Date
+
+          Write-Host ""
+          Write-Host "===== TIMING SUMMARY ====="
+          Write-Host ("Configure: {0:F1}s" -f ($configEnd - $start).TotalSeconds)
+          Write-Host ("Build:     {0:F1}s ({1:F1}m)" -f ($buildEnd - $configEnd).TotalSeconds, ($buildEnd - $configEnd).TotalMinutes)
+          Write-Host ("Install:   {0:F1}s" -f ($installEnd - $buildEnd).TotalSeconds)
+          Write-Host ("Total:     {0:F1}s ({1:F1}m)" -f ($installEnd - $start).TotalSeconds, ($installEnd - $start).TotalMinutes)
+          Write-Host "Tuning:    nvcc-threads=${{ matrix.nvcc-threads }} build=-l nproc + CMake JOB_POOL"
         env:
           CMAKE_GENERATOR: Ninja
-
-  go_mod_tidy:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: check that 'go mod tidy' is clean
-        run: go mod tidy --diff || (echo "Please run 'go mod tidy'." && exit 1)
-
-  test:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    env:
-      CGO_ENABLED: '1'
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: 'go.mod'
-          cache-dependency-path: |
-            go.sum
-            Makefile.sync
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-      - name: Install UI dependencies
-        working-directory: ./app/ui/app
-        run: npm ci
-      - name: Install tscriptify
-        run: |
-          go install github.com/tkrajina/typescriptify-golang-structs/tscriptify@latest
-      - name: Run UI tests
-        if: ${{ startsWith(matrix.os, 'ubuntu') }}
-        working-directory: ./app/ui/app
-        run: npm test
-      - name: Run go generate
-        run: go generate ./...
-
-      - name: go test
+      - name: ccache stats
         if: always()
-        run: go test -count=1 -benchtime=1x ./...
-
-      - uses: golangci/golangci-lint-action@v9
-        with:
-          only-new-issues: true
-
-  patches:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Verify patches apply cleanly and do not change files
         run: |
-          make -f Makefile.sync clean checkout apply-patches sync
-          git diff --compact-summary --exit-code
+          ccache -s
+      - name: Stop instrumentation and summarize
+        if: always()
+        shell: bash
+        continue-on-error: true
+        run: |
+          INSTDIR="$RUNNER_TEMP/instrumentation"
+          [ -d "$INSTDIR" ] || { echo "no instrumentation dir, nothing to do"; exit 0; }
+
+          # Graceful stop first - taskkill WITHOUT /F lets typeperf flush
+          # its CSV buffer.  /F (TerminateProcess) skips the flush and we
+          # end up with empty/truncated CSVs.
+          for pidfile in typeperf-sys.pid typeperf-cores.pid ps-sampler.pid; do
+            [ -f "$INSTDIR/$pidfile" ] || continue
+            pid=$(cat "$INSTDIR/$pidfile")
+            taskkill //PID "$pid" 2>/dev/null || true
+          done
+          sleep 5  # allow flush
+
+          # Force-kill anything that didn't honor the graceful signal
+          for pidfile in typeperf-sys.pid typeperf-cores.pid ps-sampler.pid; do
+            [ -f "$INSTDIR/$pidfile" ] || continue
+            pid=$(cat "$INSTDIR/$pidfile")
+            taskkill //F //PID "$pid" 2>/dev/null || true
+          done
+
+          # Surface any typeperf complaints (counter unavailable, etc.)
+          for err in typeperf-sys.err typeperf-cores.err ps-sampler.err; do
+            if [ -s "$INSTDIR/$err" ]; then
+              echo "===== $err ====="
+              head -30 "$INSTDIR/$err"
+              echo
+            fi
+          done
+
+          echo "===== Instrumentation files ====="
+          ls -lh "$INSTDIR/" || true
+          echo
+
+          # Summary from perf-system.csv if it has data.  typeperf CSV:
+          # row 0 = header, col 0 = timestamp, cols 1..N = counter values.
+          # Empty/missing samples come through as space-padded strings.
+          SYS="$INSTDIR/perf-system.csv"
+          if [ -s "$SYS" ]; then
+            ROWS=$(($(wc -l < "$SYS") - 1))
+            echo "===== INSTRUMENTATION SUMMARY ====="
+            echo "Samples (rows):    $ROWS"
+            # Total RAM (KB -> GB) for context
+            TOTAL_KB=$(wmic ComputerSystem get TotalPhysicalMemory /value 2>/dev/null | tr -d '\r' | grep -oE '[0-9]+' | head -1)
+            if [ -n "$TOTAL_KB" ]; then
+              echo "Total RAM:         $((TOTAL_KB / 1024 / 1024 / 1024)) GB"
+            fi
+            # Per-counter min/max/avg using awk; column names in header
+            head -1 "$SYS" | tr ',' '\n' | nl -ba | tail -n +2 | while read idx col; do
+              # Strip surrounding quotes for display
+              name=$(echo "$col" | sed 's/^"\(.*\)"$/\1/' | sed 's|.*\\||')
+              vals=$(awk -F',' -v c=$idx 'NR>1 {gsub(/"/,"",$c); if ($c ~ /^[0-9.]+$/) print $c}' "$SYS")
+              if [ -n "$vals" ]; then
+                stats=$(echo "$vals" | awk '
+                  NR==1 {min=max=sum=$1; n=1; next}
+                  {sum+=$1; n++; if ($1<min) min=$1; if ($1>max) max=$1}
+                  END {printf "min=%.1f max=%.1f avg=%.1f", min, max, sum/n}')
+                printf "  %-50s %s\n" "$name" "$stats"
+              fi
+            done
+          else
+            echo "WARNING: perf-system.csv missing or empty"
+          fi
+      - name: Upload instrumentation
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: instrumentation-windows-mlx
+          path: ${{ runner.temp }}\instrumentation\
+          if-no-files-found: warn
